@@ -1,25 +1,41 @@
-"""Telegram-бот: проверка ИНН в реестре лицензий Росздравнадзора."""
+"""Telegram-бот: проверка ИНН в реестре лицензий Росздравнадзора.
+
+Работает напрямую с Telegram Bot API через httpx (без aiogram), чтобы
+устанавливаться на любой версии Python без сборки компонентов.
+"""
 from __future__ import annotations
 
 import asyncio
 import html
 import logging
 import os
+from pathlib import Path
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
-from dotenv import load_dotenv
+import httpx
 
 from .client import PAGE_URL, RznClient, RznError, SearchResult
 from .inn import normalize_inn, validate_inn
 
 MAX_RECORDS = 10
 MAX_MESSAGE = 4000
+HELP_TEXT = (
+    "Отправьте ИНН организации (10 цифр) или ИП (12 цифр) — я проверю наличие "
+    "лицензий в реестре Росздравнадзора.\n\nМожно также: <code>/inn 7707083893</code>"
+)
 
 log = logging.getLogger("rzn_bot")
+
+
+def load_env(path: Path) -> None:
+    """Простейшее чтение .env: строки вида KEY=VALUE."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 def _ssl_verify(value: str) -> bool | str:
@@ -61,65 +77,132 @@ def format_result(result: SearchResult) -> list[str]:
     return messages
 
 
-def build_dispatcher(client: RznClient) -> Dispatcher:
-    dp = Dispatcher()
+class TelegramError(Exception):
+    pass
 
-    @dp.message(CommandStart())
-    @dp.message(Command("help"))
-    async def start(message: Message) -> None:
-        await message.answer(
-            "Отправьте ИНН организации (10 цифр) или ИП (12 цифр) — я проверю наличие "
-            "лицензий в реестре Росздравнадзора.\n\nМожно также: <code>/inn 7707083893</code>"
+
+class Bot:
+    def __init__(self, token: str, rzn: RznClient) -> None:
+        self.rzn = rzn
+        self.base = f"https://api.telegram.org/bot{token}/"
+        self.http = httpx.AsyncClient(timeout=httpx.Timeout(70.0, connect=15.0))
+
+    async def api(self, method: str, **params):
+        resp = await self.http.post(self.base + method, json=params)
+        data = resp.json()
+        if not data.get("ok"):
+            raise TelegramError(f"{resp.status_code}: {data.get('description')}")
+        return data["result"]
+
+    async def send(self, chat_id: int, text: str) -> None:
+        await self.api(
+            "sendMessage",
+            chat_id=chat_id,
+            text=text,
+            parse_mode="HTML",
+            link_preview_options={"is_disabled": True},
         )
 
-    @dp.message(Command("inn"))
-    @dp.message(F.text)
-    async def check(message: Message) -> None:
-        text = message.text or ""
-        if text.startswith("/inn"):
-            text = text[4:]
+    async def handle_text(self, chat_id: int, text: str) -> None:
+        text = text.strip()
+        command = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+        if command in ("/start", "/help"):
+            await self.send(chat_id, HELP_TEXT)
+            return
+        if command == "/inn":
+            text = text[len(text.split()[0]):]
+        elif command:
+            await self.send(chat_id, HELP_TEXT)
+            return
+
         inn = normalize_inn(text)
         ok, error = validate_inn(inn)
         if not ok:
-            await message.answer(f"⚠️ {error}")
+            await self.send(chat_id, f"⚠️ {error}")
             return
-        await message.bot.send_chat_action(message.chat.id, "typing")
         try:
-            result = await client.search_by_inn(inn)
+            await self.api("sendChatAction", chat_id=chat_id, action="typing")
+        except Exception:
+            pass
+        try:
+            result = await self.rzn.search_by_inn(inn)
         except RznError as exc:
             log.warning("Ошибка запроса для %s: %s", inn, exc)
-            await message.answer(f"❌ {html.escape(str(exc))}\nПопробуйте позже.")
+            await self.send(chat_id, f"❌ {html.escape(str(exc))}\nПопробуйте позже.")
             return
         except Exception:
             log.exception("Непредвиденная ошибка для %s", inn)
-            await message.answer("❌ Не удалось разобрать ответ сайта. Попробуйте позже.")
+            await self.send(chat_id, "❌ Не удалось разобрать ответ сайта. Попробуйте позже.")
             return
         for chunk in format_result(result):
-            await message.answer(chunk, disable_web_page_preview=True)
+            await self.send(chat_id, chunk)
 
-    return dp
+    async def handle_update(self, update: dict) -> None:
+        msg = update.get("message") or {}
+        text = msg.get("text")
+        chat_id = (msg.get("chat") or {}).get("id")
+        if not text or chat_id is None:
+            return
+        log.info("Запрос из чата %s: %s", chat_id, text)
+        try:
+            await self.handle_text(chat_id, text)
+        except Exception:
+            log.exception("Не удалось обработать сообщение")
+
+    async def run(self) -> None:
+        me = await self.api("getMe")
+        await self.api("deleteWebhook")
+        log.info("Бот @%s работает. Напишите ему в Telegram.", me.get("username"))
+        offset = None
+        tasks: set[asyncio.Task] = set()
+        while True:
+            try:
+                params = {"timeout": 50, "allowed_updates": ["message"]}
+                if offset is not None:
+                    params["offset"] = offset
+                updates = await self.api("getUpdates", **params)
+            except (httpx.HTTPError, TelegramError, ValueError) as exc:
+                log.warning("Нет связи с Telegram (%s), повтор через 5 секунд", exc)
+                await asyncio.sleep(5)
+                continue
+            for update in updates:
+                offset = update["update_id"] + 1
+                task = asyncio.create_task(self.handle_update(update))
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+
+    async def close(self) -> None:
+        await self.http.aclose()
 
 
 async def main() -> None:
-    load_dotenv()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    token = os.environ.get("BOT_TOKEN")
+    load_env(Path(__file__).resolve().parent.parent / ".env")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    token = os.environ.get("BOT_TOKEN", "").strip()
     if not token:
-        raise SystemExit("Не задан BOT_TOKEN (см. .env.example)")
-    client = RznClient(
+        raise SystemExit("Не задан BOT_TOKEN (удалите файл .env и запустите start.sh заново)")
+    rzn = RznClient(
         search_url=os.getenv("RZN_SEARCH_URL", "https://roszdravnadzor.gov.ru/ajax/services/licenses"),
         inn_param=os.getenv("RZN_INN_PARAM", "q_inn"),
         method=os.getenv("RZN_METHOD", "POST"),
         verify=_ssl_verify(os.getenv("RZN_SSL_VERIFY", "true")),
         timeout=float(os.getenv("RZN_TIMEOUT", "30")),
     )
-    bot = Bot(token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    bot = Bot(token, rzn)
     try:
-        await build_dispatcher(client).start_polling(bot)
+        await bot.run()
+    except TelegramError as exc:
+        if "401" in str(exc) or "Unauthorized" in str(exc):
+            raise SystemExit("Telegram не принял токен. Удалите файл .env и запустите start.sh заново.")
+        raise
     finally:
-        await client.close()
-        await bot.session.close()
+        await rzn.close()
+        await bot.close()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Бот остановлен.")

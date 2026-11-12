@@ -36,3 +36,27 @@ def test_parse_html_table():
 def test_format_empty():
     msgs = format_result(SearchResult(inn="7707083893", records=[]))
     assert "не найдено" in msgs[0]
+
+
+def test_bot_handles_inn(monkeypatch):
+    import asyncio
+    from rzn_bot.__main__ import Bot
+    from rzn_bot.client import LicenseRecord
+
+    class FakeRzn:
+        async def search_by_inn(self, inn):
+            return SearchResult(inn=inn, records=[LicenseRecord([("Статус", "Действует")])])
+
+    sent = []
+    bot = Bot("x", FakeRzn())
+
+    async def fake_api(method, **params):
+        sent.append((method, params))
+        return True
+
+    monkeypatch.setattr(bot, "api", fake_api)
+    asyncio.run(bot.handle_update({"message": {"chat": {"id": 1}, "text": "/inn 7707083893"}}))
+    asyncio.run(bot.handle_update({"message": {"chat": {"id": 1}, "text": "123"}}))
+    texts = [p["text"] for m, p in sent if m == "sendMessage"]
+    assert "Действует" in texts[0]
+    assert "10 цифр" in texts[1]
