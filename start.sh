@@ -2,7 +2,7 @@
 cd "$(dirname "$0")"
 command -v python3 >/dev/null || { echo "Установите Python 3: https://www.python.org/downloads/"; exit 1; }
 
-deps_ok() { [ -x .venv/bin/python ] && .venv/bin/python -c "import httpx, bs4" 2>/dev/null; }
+deps_ok() { [ -x .venv/bin/python ] && .venv/bin/python -c "import httpx, bs4, socksio" 2>/dev/null; }
 
 if ! deps_ok; then
   echo "Устанавливаю нужные компоненты, подождите 1-2 минуты..."

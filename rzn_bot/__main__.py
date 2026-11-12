@@ -82,10 +82,10 @@ class TelegramError(Exception):
 
 
 class Bot:
-    def __init__(self, token: str, rzn: RznClient) -> None:
+    def __init__(self, token: str, rzn: RznClient, proxy: str | None = None) -> None:
         self.rzn = rzn
         self.base = f"https://api.telegram.org/bot{token}/"
-        self.http = httpx.AsyncClient(timeout=httpx.Timeout(70.0, connect=15.0))
+        self.http = httpx.AsyncClient(timeout=httpx.Timeout(70.0, connect=15.0), proxy=proxy or None)
 
     async def api(self, method: str, **params):
         resp = await self.http.post(self.base + method, json=params)
@@ -150,8 +150,18 @@ class Bot:
             log.exception("Не удалось обработать сообщение")
 
     async def run(self) -> None:
-        me = await self.api("getMe")
-        await self.api("deleteWebhook")
+        while True:
+            try:
+                me = await self.api("getMe")
+                await self.api("deleteWebhook")
+                break
+            except httpx.HTTPError:
+                log.warning(
+                    "Нет связи с Telegram (api.telegram.org). Если Telegram у вас работает только "
+                    "через VPN или прокси — включите VPN или укажите TG_PROXY в файле .env. "
+                    "Повтор через 10 секунд..."
+                )
+                await asyncio.sleep(10)
         log.info("Бот @%s работает. Напишите ему в Telegram.", me.get("username"))
         offset = None
         tasks: set[asyncio.Task] = set()
@@ -189,7 +199,7 @@ async def main() -> None:
         verify=_ssl_verify(os.getenv("RZN_SSL_VERIFY", "true")),
         timeout=float(os.getenv("RZN_TIMEOUT", "30")),
     )
-    bot = Bot(token, rzn)
+    bot = Bot(token, rzn, proxy=os.getenv("TG_PROXY", "").strip() or None)
     try:
         await bot.run()
     except TelegramError as exc:
